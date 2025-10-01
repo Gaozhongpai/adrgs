@@ -508,6 +508,7 @@ renderCUDA(
 			float pow_term = 0.0f;
 			float beta_value = 0.0f;
 			bool saturated = false;
+			const int global_id = collected_id[j];
 
 			if (has_beta)
 			{
@@ -539,7 +540,6 @@ renderCUDA(
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
 			// pair).
 			float dL_dalpha = 0.0f;
-			const int global_id = collected_id[j];
 			for (int ch = 0; ch < C; ch++)
 			{
 				const float c = collected_colors[ch * BLOCK_SIZE + j];

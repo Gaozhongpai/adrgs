@@ -452,6 +452,7 @@ int CudaRasterizer::Rasterizer::forwardPure(
 		scale_modifier,
 		(glm::vec4*)rotations,
 		opacities,
+		betas,
 		shs,
 		geomState.clamped,
 		cov3D_precomp,

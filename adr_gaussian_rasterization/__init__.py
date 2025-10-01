@@ -243,8 +243,8 @@ class GaussianRasterizationSettings(NamedTuple):
     sh_degree : int
     campos : torch.Tensor
     prefiltered : bool
-    pure: bool
-    debug : bool
+    pure: bool = False
+    debug : bool = False
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):
@@ -262,7 +262,7 @@ class GaussianRasterizer(nn.Module):
             
         return visible
 
-    def forward(self, means3D, means2D, opacities, betas = None, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
+    def forward(self, means3D, means2D, opacities, scores=None, betas = None, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
         
         raster_settings = self.raster_settings
 
