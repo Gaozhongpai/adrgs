@@ -14,6 +14,7 @@
 #include <fstream>
 #include <algorithm>
 #include <numeric>
+#include <cstdint>
 #include <cuda.h>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
@@ -26,9 +27,20 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
+#include "config.h"
 #include "auxiliary.h"
 #include "forward.h"
 #include "backward.h"
+#if USE_TCGS
+#include "tcgs/tcgs.h"
+
+__global__ void convertLoadFromContrib(int N, const uint32_t* n_contrib, float* load)
+{
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < N)
+		load[idx] = static_cast<float>(n_contrib[idx]);
+}
+#endif
 
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
@@ -209,6 +221,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* shs,
 	const float* colors_precomp,
 	const float* opacities,
+	const float* betas,
 	const float* scales,
 	const float scale_modifier,
 	const float* rotations,
@@ -258,6 +271,7 @@ int CudaRasterizer::Rasterizer::forward(
 		scale_modifier,
 		(glm::vec4*)rotations,
 		opacities,
+		betas,
 		shs,
 		geomState.clamped,
 		cov3D_precomp,
@@ -327,6 +341,37 @@ int CudaRasterizer::Rasterizer::forward(
 
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+#if USE_TCGS
+	CHECK_CUDA(TCGS::renderCUDA_Forward(
+			tile_grid,
+			block,
+			imgState.ranges,
+			reinterpret_cast<const unsigned int*>(binningState.point_list),
+			width,
+			height,
+			P,
+			geomState.means2D,
+			feature_ptr,
+			betas,
+			geomState.conic_opacity,
+			imgState.accum_alpha,
+			reinterpret_cast<unsigned int*>(imgState.n_contrib),
+			background,
+			out_color,
+			geomState.depths,
+			nullptr), debug);
+
+	if (load != nullptr)
+	{
+		int total_pixels = width * height;
+		int threads = 256;
+		int blocks = (total_pixels + threads - 1) / threads;
+		convertLoadFromContrib<<<blocks, threads>>>(total_pixels, imgState.n_contrib, load);
+		CHECK_CUDA(cudaGetLastError(), debug);
+	}
+
+	return num_rendered;
+#endif
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
 		imgState.ranges,
@@ -335,6 +380,7 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.means2D,
 		feature_ptr,
 		geomState.conic_opacity,
+		betas,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
@@ -357,6 +403,7 @@ int CudaRasterizer::Rasterizer::forwardPure(
 	const float* shs,
 	const float* colors_precomp,
 	const float* opacities,
+	const float* betas,
 	const float* scales,
 	const float scale_modifier,
 	const float* rotations,
@@ -474,6 +521,27 @@ int CudaRasterizer::Rasterizer::forwardPure(
 
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+#if USE_TCGS
+	CHECK_CUDA(TCGS::renderCUDA_Forward(
+		tile_grid,
+		block,
+		imgState.ranges,
+		reinterpret_cast<const unsigned int*>(binningState.point_list),
+		width,
+		height,
+		P,
+		geomState.means2D,
+		feature_ptr,
+		betas,
+		geomState.conic_opacity,
+		imgState.accum_alpha,
+		reinterpret_cast<unsigned int*>(imgState.n_contrib),
+		background,
+		out_color,
+		geomState.depths,
+		nullptr), debug);
+	return num_rendered;
+#else
 	CHECK_CUDA(FORWARD::renderPure(
 		tile_grid, block,
 		imgState.ranges,
@@ -482,10 +550,12 @@ int CudaRasterizer::Rasterizer::forwardPure(
 		geomState.means2D,
 		feature_ptr,
 		geomState.conic_opacity,
+		betas,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
 		out_color), debug)
+#endif
 
 	return num_rendered;
 }
@@ -522,6 +592,8 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dsh,
 	float* dL_dscale,
 	float* dL_drot,
+	const float* betas,
+	float* dL_dbeta,
 	bool debug)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
@@ -560,7 +632,9 @@ void CudaRasterizer::Rasterizer::backward(
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,
-		dL_dcolor), debug)
+		dL_dcolor,
+		betas,
+		dL_dbeta), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,

@@ -413,7 +413,9 @@ renderCUDA(
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors,
+	const float* __restrict__ betas,
+	float* __restrict__ dL_dbeta)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -465,6 +467,7 @@ renderCUDA(
 	const float ddely_dy = 0.5 * H;
 	const float alpha_low = 0.00392f; // 1 / 255
 	const float k_sigmoid = 1000.0f;
+	const bool has_beta = betas != nullptr;
 
 	// Traverse all Gaussians
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -497,12 +500,35 @@ renderCUDA(
 			const float2 xy = collected_xy[j];
 			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			const float4 con_o = collected_conic_opacity[j];
-			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
-			if (power > 0.0f)
-				continue;
 
-			const float G = exp(power);
-			const float alpha = min(0.99f, con_o.w * G);
+			float alpha = 0.0f;
+			float G = 0.0f;
+			float sigma = 0.0f;
+			float base = 1.0f;
+			float pow_term = 0.0f;
+			float beta_value = 0.0f;
+			bool saturated = false;
+
+			if (has_beta)
+			{
+				beta_value = betas[global_id];
+				sigma = con_o.x * d.x * d.x + con_o.z * d.y * d.y + 2.f * con_o.y * d.x * d.y;
+				if (sigma < 0.0f || sigma >= 1.0f)
+					continue;
+				base = fmaxf(1e-6f, 1.0f - sigma);
+				pow_term = powf(base, beta_value);
+				float raw_alpha = con_o.w * pow_term;
+				saturated = raw_alpha > 0.99f;
+				alpha = saturated ? 0.99f : raw_alpha;
+			}
+			else
+			{
+				const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+				if (power > 0.0f)
+					continue;
+				G = expf(power);
+				alpha = fminf(0.99f, con_o.w * G);
+			}
 			if (alpha < 1.0f / 255.0f)
 				continue;
 
@@ -544,24 +570,45 @@ renderCUDA(
 			float dload_dalpha = k_sigmoid * e_alpha / ((1 + e_alpha) * (1 + e_alpha));
             dL_dalpha += dload_dalpha * dL_dload;
 
-			// Helpful reusable temporary variables
-			const float dL_dG = con_o.w * dL_dalpha;
-			const float gdx = G * d.x;
-			const float gdy = G * d.y;
-			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+			if (has_beta)
+			{
+				if (!saturated)
+				{
+					const float inv_base = 1.0f / base;
+					const float pow_beta_minus_1 = pow_term * inv_base;
+					const float v_sigma = -dL_dalpha * con_o.w * beta_value * pow_beta_minus_1;
+					const float grad_mean_x = 2.f * v_sigma * (con_o.x * d.x + con_o.y * d.y);
+					const float grad_mean_y = 2.f * v_sigma * (con_o.y * d.x + con_o.z * d.y);
+					atomicAdd(&dL_dmean2D[global_id].x, grad_mean_x * ddelx_dx);
+					atomicAdd(&dL_dmean2D[global_id].y, grad_mean_y * ddely_dy);
+					atomicAdd(&dL_dconic2D[global_id].x, v_sigma * d.x * d.x);
+					atomicAdd(&dL_dconic2D[global_id].y, 2.f * v_sigma * d.x * d.y);
+					atomicAdd(&dL_dconic2D[global_id].w, v_sigma * d.y * d.y);
+					atomicAdd(&(dL_dopacity[global_id]), pow_term * dL_dalpha);
+					if (dL_dbeta != nullptr)
+					{
+						const float log_base = logf(base);
+						atomicAdd(&(dL_dbeta[global_id]), dL_dalpha * con_o.w * pow_term * log_base);
+					}
+				}
+			}
+			else
+			{
+				const float dL_dG = con_o.w * dL_dalpha;
+				const float gdx = G * d.x;
+				const float gdy = G * d.y;
+				const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+				const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
 
-			// Update gradients w.r.t. 2D mean position of the Gaussian
-			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
-			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
+				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
 
-			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+				atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
+				atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
+				atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
 
-			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+				atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+			}
 		}
 	}
 }
@@ -647,7 +694,9 @@ void BACKWARD::render(
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	const float* betas,
+	float* dL_dbeta)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
@@ -664,6 +713,8 @@ void BACKWARD::render(
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
-		dL_dcolors
+		dL_dcolors,
+		betas,
+		dL_dbeta
 		);
 }

@@ -160,6 +160,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const float scale_modifier,
 	const glm::vec4* rotations,
 	const float* opacities,
+	const float* betas,
 	const float* shs,
 	bool* clamped,
 	const float* cov3D_precomp,
@@ -235,11 +236,30 @@ __global__ void preprocessCUDA(int P, int D, int M,
     // AABB: Get x_max & y_max
     const float inv_coefficient_low = inv_alpha_low * opacities[idx];
     if(inv_coefficient_low < 1.0f) return;
-    const float coefficient_ln = 2.f * log(inv_coefficient_low);
+
+    const bool has_beta = betas != nullptr;
+    float sigma_max = 0.0f;
+    if(has_beta)
+    {
+        float beta = betas[idx];
+        // Clamp beta to positive values; fall back to Gaussian path otherwise
+        if(beta > 0.0f)
+        {
+            float base_min = powf(inv_coefficient_low, -1.0f / beta);
+            base_min = fminf(base_min, 1.0f);
+            sigma_max = 1.0f - base_min;
+        }
+    }
+
+    if(!has_beta || sigma_max <= 0.0f)
+    {
+        const float coefficient_ln = 2.f * log(inv_coefficient_low);
+        sigma_max = fmaxf(coefficient_ln, 0.0f);
+    }
 
     float2 my_adr = { my_radius, my_radius };
-    const float x_max = ceil(sqrt(cov.x * coefficient_ln));
-    const float y_max = ceil(sqrt(cov.z * coefficient_ln));
+    const float x_max = ceil(sqrt(fmaxf(0.0f, cov.x * sigma_max)));
+    const float y_max = ceil(sqrt(fmaxf(0.0f, cov.z * sigma_max)));
     if(x_max < my_adr.x) my_adr.x = x_max;
     if(y_max < my_adr.y) my_adr.y = y_max;
 
@@ -282,6 +302,7 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ betas,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
@@ -311,6 +332,7 @@ renderCUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	const bool has_beta = betas != nullptr;
 
 	// Initialize helper variables
 	float T = 1.0f;
@@ -347,18 +369,27 @@ renderCUDA(
 			// Splatting" by Zwicker et al., 2001)
 			float2 xy = collected_xy[j];
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
-			float4 con_o = collected_conic_opacity[j];
+		float4 con_o = collected_conic_opacity[j];
+		float alpha;
+		if (has_beta)
+		{
+			float beta = betas[collected_id[j]];
+			float sigma = con_o.x * d.x * d.x + con_o.z * d.y * d.y + 2.f * con_o.y * d.x * d.y;
+			if (sigma < 0.0f || sigma >= 1.0f)
+				continue;
+			float base = 1.0f - sigma;
+			float weight = __powf(base, beta);
+			alpha = fminf(0.99f, con_o.w * weight);
+		}
+		else
+		{
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
-
-			// Eq. (2) from 3D Gaussian splatting paper.
-			// Obtain alpha by multiplying with Gaussian opacity
-			// and its exponential falloff from mean.
-			// Avoid numerical instabilities (see paper appendix). 
-			float alpha = min(0.99f, con_o.w * exp(power));
-			if (alpha < 1.0f / 255.0f)
-				continue;
+			alpha = fminf(0.99f, con_o.w * exp(power));
+		}
+		if (alpha < 1.0f / 255.0f)
+			continue;
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f)
 			{
@@ -402,6 +433,7 @@ renderPureCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ betas,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
@@ -430,6 +462,7 @@ renderPureCUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	const bool has_beta = betas != nullptr;
 
 	// Initialize helper variables
 	float T = 1.0f;
@@ -466,18 +499,27 @@ renderPureCUDA(
 			// Splatting" by Zwicker et al., 2001)
 			float2 xy = collected_xy[j];
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
-			float4 con_o = collected_conic_opacity[j];
+		float4 con_o = collected_conic_opacity[j];
+		float alpha;
+		if (has_beta)
+		{
+			float beta = betas[collected_id[j]];
+			float sigma = con_o.x * d.x * d.x + con_o.z * d.y * d.y + 2.f * con_o.y * d.x * d.y;
+			if (sigma < 0.0f || sigma >= 1.0f)
+				continue;
+			float base = 1.0f - sigma;
+			float weight = __powf(base, beta);
+			alpha = fminf(0.99f, con_o.w * weight);
+		}
+		else
+		{
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
-
-			// Eq. (2) from 3D Gaussian splatting paper.
-			// Obtain alpha by multiplying with Gaussian opacity
-			// and its exponential falloff from mean.
-			// Avoid numerical instabilities (see paper appendix). 
-			float alpha = min(0.99f, con_o.w * exp(power));
-			if (alpha < 1.0f / 255.0f)
-				continue;
+			alpha = fminf(0.99f, con_o.w * exp(power));
+		}
+		if (alpha < 1.0f / 255.0f)
+			continue;
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f)
 			{
@@ -516,6 +558,7 @@ void FORWARD::render(
 	const float2* means2D,
 	const float* colors,
 	const float4* conic_opacity,
+	const float* betas,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
@@ -529,6 +572,7 @@ void FORWARD::render(
 		means2D,
 		colors,
 		conic_opacity,
+		betas,
 		final_T,
 		n_contrib,
 		bg_color,
@@ -544,6 +588,7 @@ void FORWARD::renderPure(
 	const float2* means2D,
 	const float* colors,
 	const float4* conic_opacity,
+	const float* betas,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
@@ -556,6 +601,7 @@ void FORWARD::renderPure(
 		means2D,
 		colors,
 		conic_opacity,
+		betas,
 		final_T,
 		n_contrib,
 		bg_color,
@@ -569,6 +615,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	const float scale_modifier,
 	const glm::vec4* rotations,
 	const float* opacities,
+	const float* betas,
 	const float* shs,
 	bool* clamped,
 	const float* cov3D_precomp,
@@ -598,6 +645,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		scale_modifier,
 		rotations,
 		opacities,
+		betas,
 		shs,
 		clamped,
 		cov3D_precomp,

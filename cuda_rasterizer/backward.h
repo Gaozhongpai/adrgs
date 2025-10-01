@@ -36,7 +36,9 @@ namespace BACKWARD
 		float3* dL_dmean2D,
 		float4* dL_dconic2D,
 		float* dL_dopacity,
-		float* dL_dcolors);
+		float* dL_dcolors,
+		const float* betas,
+		float* dL_dbeta);
 
 	void preprocess(
 		int P, int D, int M,

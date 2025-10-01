@@ -39,6 +39,7 @@ namespace CudaRasterizer
 			const float* shs,
 			const float* colors_precomp,
 			const float* opacities,
+			const float* betas,
 			const float* scales,
 			const float scale_modifier,
 			const float* rotations,
@@ -64,6 +65,7 @@ namespace CudaRasterizer
 			const float* shs,
 			const float* colors_precomp,
 			const float* opacities,
+			const float* betas,
 			const float* scales,
 			const float scale_modifier,
 			const float* rotations,
@@ -107,6 +109,8 @@ namespace CudaRasterizer
 			float* dL_dsh,
 			float* dL_dscale,
 			float* dL_drot,
+			const float* betas,
+			float* dL_dbeta,
 			bool debug);
 	};
 };

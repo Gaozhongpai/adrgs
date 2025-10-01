@@ -38,6 +38,7 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& means3D,
     const torch::Tensor& colors,
     const torch::Tensor& opacity,
+	const torch::Tensor& betas,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
 	const float scale_modifier,
@@ -77,6 +78,9 @@ RasterizeGaussiansCUDA(
   std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
+
+  torch::Tensor betas_contiguous = betas.contiguous();
+  const float* betas_ptr = betas_contiguous.numel() ? betas_contiguous.data_ptr<float>() : nullptr;
   
   int rendered = 0;
   if(P != 0)
@@ -98,6 +102,7 @@ RasterizeGaussiansCUDA(
 		sh.contiguous().data_ptr<float>(),
 		colors.contiguous().data<float>(), 
 		opacity.contiguous().data<float>(), 
+		betas_ptr,
 		scales.contiguous().data_ptr<float>(),
 		scale_modifier,
 		rotations.contiguous().data_ptr<float>(),
@@ -122,6 +127,7 @@ RasterizeGaussiansPureCUDA(
 	const torch::Tensor& means3D,
     const torch::Tensor& colors,
     const torch::Tensor& opacity,
+	const torch::Tensor& betas,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
 	const float scale_modifier,
@@ -164,6 +170,9 @@ RasterizeGaussiansPureCUDA(
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
 
+  torch::Tensor betas_contiguous = betas.contiguous();
+  const float* betas_ptr = betas_contiguous.numel() ? betas_contiguous.data_ptr<float>() : nullptr;
+
   int rendered = 0;
   if(P != 0)
   {
@@ -186,6 +195,7 @@ RasterizeGaussiansPureCUDA(
 		sh.contiguous().data_ptr<float>(),
 		colors.contiguous().data<float>(),
 		opacity.contiguous().data<float>(),
+		betas_ptr,
 		scales.contiguous().data_ptr<float>(),
 		scale_modifier,
 		rotations.contiguous().data_ptr<float>(),
@@ -207,8 +217,8 @@ RasterizeGaussiansPureCUDA(
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
- RasterizeGaussiansBackwardCUDA(
- 	const torch::Tensor& background,
+RasterizeGaussiansBackwardCUDA(
+	const torch::Tensor& background,
 	const torch::Tensor& means3D,
 	const torch::Tensor& radii,
     const torch::Tensor& colors,
@@ -229,6 +239,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const int R,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
+	const torch::Tensor& betas,
 	const bool debug) 
 {
   const int P = means3D.size(0);
@@ -250,6 +261,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dsh = torch::zeros({P, M, 3}, means3D.options());
   torch::Tensor dL_dscales = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_drotations = torch::zeros({P, 4}, means3D.options());
+
+  torch::Tensor betas_contiguous = betas.contiguous();
+  torch::Tensor dL_dbeta = torch::zeros_like(betas_contiguous);
+  const float* betas_ptr = betas_contiguous.numel() ? betas_contiguous.data_ptr<float>() : nullptr;
+  float* dL_dbeta_ptr = betas_contiguous.numel() ? dL_dbeta.data_ptr<float>() : nullptr;
   
   if(P != 0)
   {  
@@ -283,10 +299,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dsh.contiguous().data<float>(),
 	  dL_dscales.contiguous().data<float>(),
 	  dL_drotations.contiguous().data<float>(),
+	  betas_ptr,
+	  dL_dbeta_ptr,
 	  debug);
   }
 
-  return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations);
+  return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations, dL_dbeta);
 }
 
 torch::Tensor markVisible(
